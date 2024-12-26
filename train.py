@@ -5,6 +5,7 @@ on the BraTS dataset
 ========================================================
 
 Author: Muhammad Faizan
+Contributed by : Namgyu Youn
 
 All right reserved
 =========================================================
@@ -19,10 +20,10 @@ import time
 import gc
 import nibabel as nib
 import tqdm as tqdm
+import wandb
 from utils.meter import AverageMeter
 from utils.general import save_checkpoint, load_pretrained_model, resume_training
 from brats import get_datasets
-from btcv_dataset import get_dataset, get_transforms
 
 from monai.data import  decollate_batch
 import torch
@@ -43,14 +44,13 @@ from networks.models.ResUNetpp.model import ResUnetPlusPlus
 from networks.models.UNet.model import UNet3D
 from networks.models.UX_Net.network_backbone import UXNET
 from networks.models.nnformer.nnFormer_tumor import nnFormer
-from btcv_utils import train
 try:
     from thesis.models.SegUXNet.model import SegUXNet
     from thesis.models.v2.model import SegSCNet
     from thesis.models.v3.model import SCFENet
 except ModuleNotFoundError:
     print('model not available, please train with other models')
-    
+
 from functools import partial
 from utils.augment import DataAugmenter
 from utils.schedulers import SegResNetScheduler, PolyDecayScheduler
@@ -78,12 +78,12 @@ class CIdentity(nn.Module):
     def __init__(self):
         super().__init__()
         self.model = nn.Identity()
-    
+
     def forward(self, x, y):
         x = nn.Identity(x)
         y = nn.Identity(y)
         return (x, y)
-    
+
 class Solver:
     """list of optimizers for training NN"""
     def __init__(self, model: nn.Module, lr: float = 1e-4, weight_decay: float = 1e-5):
@@ -91,29 +91,29 @@ class Solver:
         self.weight_decay = weight_decay
 
         self.all_solvers = {
-            "Adam": torch.optim.Adam(model.parameters(), lr=self.lr, 
-                                     weight_decay= self.weight_decay, 
-                                     amsgrad=True), 
-            "AdamW": torch.optim.AdamW(model.parameters(), lr=self.lr, 
-                                     weight_decay= self.weight_decay, 
+            "Adam": torch.optim.Adam(model.parameters(), lr=self.lr,
+                                     weight_decay= self.weight_decay,
                                      amsgrad=True),
-            "SGD": torch.optim.SGD(model.parameters(), lr=self.lr, 
+            "AdamW": torch.optim.AdamW(model.parameters(), lr=self.lr,
+                                     weight_decay= self.weight_decay,
+                                     amsgrad=True),
+            "SGD": torch.optim.SGD(model.parameters(), lr=self.lr,
                                      weight_decay= self.weight_decay),
         }
     def select_solver(self, name):
         return self.all_solvers[name]
-    
+
 
 def save_best_model(dir_name, model, name="best_model"):
     """save best model weights"""
     save_path = os.path.join(dir_name, name)
     torch.save(model.state_dict(), f"{save_path}/{name}.pkl")
-    
+
 def save_checkpoint(dir_name, state, name="checkpoint"):
     """save checkpoint with each epoch to resume"""
     save_path = os.path.join(dir_name, name)
     torch.save(state, f"{save_path}/{name}.pth.tar")
- 
+
 def compute_loss(loss, preds, label):
         loss = loss(preds[0], label)
         for i, pred in enumerate(preds[1:]):
@@ -132,21 +132,20 @@ def create_dirs(dir_name):
 
 def init_random(seed):
     """randomly initialize some options"""
-    torch.manual_seed(seed)        
-    torch.cuda.manual_seed(seed)  
-    torch.cuda.manual_seed_all(seed) 
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     random.seed(seed)
     np.random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
-    cudnn.benchmark = False         
+    cudnn.benchmark = False
     cudnn.deterministic = True
-
 # Train for an epoch
 def train_epoch(model, loader, optimizer, loss_func, augment = True):
     """
     train the model for epoch on MRI image and given ground truth labels
     using set of arguments
-    
+
     Parameters
     ----------
     model: nn.Module
@@ -161,46 +160,48 @@ def train_epoch(model, loader, optimizer, loss_func, augment = True):
     torch.cuda.empty_cache()
     gc.collect()
     # del variables
-    model.train() 
+    model.train()
     run_loss = AverageMeter()
     for batch_data in loader:
         image, label = batch_data["image"].to(device), batch_data["label"].to(device)
         image, label = augmenter(image, label) if augment else (image, label)
         logits = model(image)
-        loss = loss_func(logits, label) 
+        loss = loss_func(logits, label)
         loss.backward()
         optimizer.step()
         optimizer.zero_grad()
         run_loss.update(loss.item(), n = batch_data["image"].shape[0])
     torch.cuda.empty_cache()
+
+    # Log training metrics to WandB
+    wandb.log({"train_loss": run_loss.avg})
+
     return run_loss.avg
 
-# Validate the model
 def val(model, loader, acc_func, model_inferer = None,
         post_sigmoid = None, post_pred = None, post_label=None):
     """
     Validation phase
-    use model and validation dataset to validate the model performance on 
+    use model and validation dataset to validate the model performance on
     validation dataset.
 
     Parameters
     ----------
     model: nn.Module
     loader: torch.util.data.Dataset
-    acc_func: monai.metrics.meandice.DiceMetric 
+    acc_func: monai.metrics.meandice.DiceMetric
     num_epochs: int
     epochs: int
     model_inferer: nn.Module
     post_sigmoid: monai.transforms.post.array.Activations
-    post_pred:monai.transforms.post.array.AsDiscrete
-    """
+    post_pred:monai.transforms.post.array.AsDiscrete    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.eval()
     run_acc = AverageMeter()
     with torch.no_grad():
         for batch_data in loader:
             logits = model_inferer(batch_data["image"].to(device))
-            masks = decollate_batch(batch_data["label"].to(device)) 
+            masks = decollate_batch(batch_data["label"].to(device))
             prediction_lists = decollate_batch(logits)
             predictions = [post_pred(post_sigmoid(prediction)) for prediction in prediction_lists]
             # masks = [post_label(mask) for mask in masks]
@@ -208,6 +209,16 @@ def val(model, loader, acc_func, model_inferer = None,
             acc_func(y_pred = predictions, y = masks)
             acc, not_nans = acc_func.aggregate()
             run_acc.update(acc.cpu().numpy(), n = not_nans.cpu().numpy())
+
+    # Log validation metrics to WandB
+    dice_tc, dice_wt, dice_et = run_acc.avg
+    wandb.log({
+        "val_dice_tc": dice_tc,
+        "val_dice_wt": dice_wt,
+        "val_dice_et": dice_et,
+        "val_mean_dice": np.mean(run_acc.avg)
+    })
+
     return run_acc.avg
 
 # Save trained results
@@ -217,7 +228,7 @@ def save_data(training_loss,
               epochs, cfg):
     """
     save the training data for later use
-    
+
     Parameters
     ----------
     training_loss: list
@@ -238,6 +249,12 @@ def save_data(training_loss,
     save_path = os.path.join(cfg.training.exp_name, "csv")
     os.makedirs(save_path, exist_ok= True)
     data_df.to_csv(os.path.join(save_path, "training_data.csv"))
+
+    # Log final results as WandB artifact
+    artifact = wandb.Artifact('training_results', type='dataset')
+    artifact.add_file(os.path.join(save_path, "training_data.csv"))
+    wandb.log_artifact(artifact)
+
     return data
 
 def trainer(cfg,
@@ -263,7 +280,7 @@ def trainer(cfg,
     val_loader: torch.utils.data.Dataset
     optimizer: torch.optim
     loss_func: monai.losses.dice.DiceLoss
-    acc_func:  monai.metrics.meandice.DiceMetric 
+    acc_func:  monai.metrics.meandice.DiceMetric
     schedular: torch.optim.lr_scheduler.CosineAnnealingLR
     max_epochs: int
     model_inferer: nn.Module
@@ -278,6 +295,9 @@ def trainer(cfg,
     mean_dices = []
     epoch_losses = [] # training loss
     train_epochs = []
+
+    progress_bar = wandb.define_metric("progress", summary="max")
+
     for epoch in range(start_epoch, max_epochs):
         print()
         epoch_time = time.time()
@@ -285,6 +305,14 @@ def trainer(cfg,
                                     loader = train_loader,
                                     optimizer = optimizer,
                                     loss_func = loss_func)
+
+        # Log training progress
+        wandb.log({
+            "progress": (epoch + 1) / max_epochs * 100,
+            "epoch": epoch + 1,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
+
         print(
             "Epoch  {}/{},".format(epoch + 1, max_epochs),
             "loss: {:.4f},".format(training_loss),
@@ -295,45 +323,79 @@ def trainer(cfg,
         if epoch % val_every == 0 or epoch == 0:
             epoch_losses.append(training_loss)
             train_epochs.append(int(epoch))
-            val_acc =  val(model = model,
+            val_acc = val(model = model,
                           loader = val_loader,
                           acc_func = acc_func,
                           model_inferer= model_inferer,
                           post_sigmoid=post_sigmoid,
-                          post_pred=post_pred, 
+                          post_pred=post_pred,
                           post_label = post_label)
+
             dice_tc = val_acc[0]
             dice_wt = val_acc[1]
             dice_et = val_acc[2]
             val_mean_acc = np.mean(val_acc)
+
+            # Log detailed metrics to WandB
+            wandb.log({
+                "epoch_loss": training_loss,
+                "validation/dice_tc": dice_tc,
+                "validation/dice_wt": dice_wt,
+                "validation/dice_et": dice_et,
+                "validation/mean_dice": val_mean_acc
+            })
+
             print(
                 " Validation: "
                 "dice_tc:", "{:.4f},".format(dice_tc),
                 " dice_wt:", "{:.4f},".format(dice_wt),
                 " dice_et:", "{:.4f},".format(dice_et),
                 " mean_dice:", "{:.4f}".format(val_mean_acc))
-            
+
             dices_tc.append(dice_tc)
             dices_et.append(dice_et)
             dices_wt.append(dices_wt)
             mean_dices.append(val_mean_acc)
+
             if val_mean_acc > val_acc_max:
                 val_acc_max = val_mean_acc
                 save_best_model(cfg.training.exp_name, model, "best-model")
+
+                # Log best model as WandB artifact
+                artifact = wandb.Artifact(
+                    name=f"best_model_epoch_{epoch}",
+                    type="model",
+                    description=f"Best model with mean dice score: {val_mean_acc:.4f}"
+                )
+                artifact.add_file(os.path.join(cfg.training.exp_name, "best-model/best-model.pkl"))
+                wandb.log_artifact(artifact)
+
             scheduler.step()
-            save_checkpoint(cfg.training.exp_name, dict(epoch=epoch + 1, max_epochs=max_epochs, model = model.state_dict(), optimizer=optimizer.state_dict(), scheduler=scheduler.state_dict()), "checkpoint")
+            save_checkpoint(cfg.training.exp_name,
+                          dict(epoch=epoch + 1,
+                               max_epochs=max_epochs,
+                               model=model.state_dict(),
+                               optimizer=optimizer.state_dict(),
+                               scheduler=scheduler.state_dict()),
+                          "checkpoint")
+
     print()
     print("Training Finished!, Best Accuracy: ", val_acc_max)
 
+    # Log final training summary
+    wandb.run.summary["best_mean_dice"] = val_acc_max
+    wandb.run.summary["total_epochs"] = max_epochs
+    wandb.run.summary["final_learning_rate"] = optimizer.param_groups[0]['lr']
+
     # Save important data
     save_data(training_loss=training_loss,
-              et= dices_et,
-              wt= dices_wt,
+              et=dices_et,
+              wt=dices_wt,
               tc=dices_tc,
               val_mean_acc=mean_dices,
-              epochs=train_epochs, 
-              cfg = cfg)
-    
+              epochs=train_epochs,
+              cfg=cfg)
+
     return (
         val_acc_max,
         dices_tc,
@@ -342,7 +404,6 @@ def trainer(cfg,
         mean_dices,
         training_loss,
         train_epochs)
-
 def run(cfg, model,
         loss_func,
         acc_func,
@@ -351,14 +412,14 @@ def run(cfg, model,
         val_loader,
         scheduler,
         model_inferer = None,
-        post_sigmoid = None, 
+        post_sigmoid = None,
         post_pred = None,
         post_label = None,
         max_epochs = 100,
         val_every = 2
         ):
     '''Now train the model
-    
+
     Parameters
     ----------
     args: argparse.parser
@@ -379,7 +440,10 @@ def run(cfg, model,
     # Create experiments folders
     create_dirs(cfg.training.exp_name)
 
-    # resume 
+    # Log model architecture to WandB
+    wandb.watch(model, log="all", log_freq=100)
+
+    # resume
     if cfg.training.resume:
         print('Resuming training...')
         checkpoint = torch.load(os.path.join(cfg.training.exp_name, "checkpoint", "checkpoint.pth.tar"))
@@ -394,14 +458,20 @@ def run(cfg, model,
         scheduler.load_state_dict(checkpoint['scheduler'])
         print(f"start train from epoch = {start_epoch}/{max_epochs}")
 
+        # Log resuming information to WandB
+        wandb.log({"resume_from_epoch": start_epoch})
+
     else:
         # Training from scratch
-        print('Trainig from scrath!')
+        print('Training from scratch!')
         start_epoch = 0
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print()
     print("Total parameters count", total_params)
+
+    # Log model parameters to WandB
+    wandb.log({"model_parameters": total_params})
 
     (
     val_mean_dice_max,
@@ -412,7 +482,7 @@ def run(cfg, model,
     train_losses,
     train_epochs,
     ) = trainer(
-        cfg, 
+        cfg,
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -422,14 +492,17 @@ def run(cfg, model,
         scheduler=scheduler,
         model_inferer=model_inferer,
         start_epoch=start_epoch,
-        max_epochs= max_epochs,
+        max_epochs=max_epochs,
         post_sigmoid=post_sigmoid,
         val_every=val_every,
         post_pred=post_pred,
         post_label=post_label
     )
+
+
+
     print()
-    return (val_mean_dice_max, 
+    return (val_mean_dice_max,
             dices_tc,
             dices_wt,
             dices_et,
@@ -439,13 +512,30 @@ def run(cfg, model,
 
 @hydra.main(config_name='configs', config_path= 'conf', version_base=None)
 def main(cfg: DictConfig):
+    # Initialize WandB
+    wandb.init(
+        project="brats-segmentation",
+        config={
+            "architecture": cfg.model.architecture,
+            "learning_rate": cfg.training.learning_rate,
+            "epochs": cfg.training.max_epochs,
+            "batch_size": cfg.training.batch_size,
+            "optimizer": cfg.training.solver_name,
+            "loss_type": cfg.training.loss_type,
+            "dataset": cfg.dataset.type,
+            "seed": cfg.training.seed
+        }
+    )
+
+    # Initialize random
+    init_random(seed=cfg.training.seed)
 
     # Initialize random
     init_random(seed=cfg.training.seed)
 
     # CUDA or CPU
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
+
     # Efficient training
     torch.backends.cudnn.benchmark = True
 
@@ -456,7 +546,7 @@ def main(cfg: DictConfig):
         crop_size = (128, 128, 128)
         post_pred = AsDiscrete(argmax=False, threshold=0.5)
         post_sigmoid = Activations(sigmoid=True)
-        
+
     elif cfg.dataset.type == "btcv":
         num_classes = 14
         in_channels = 1
@@ -473,32 +563,32 @@ def main(cfg: DictConfig):
 
     # SegResNet
     if cfg.model.architecture == "segres_net":
-        model = SegResNet(spatial_dims=spatial_size, 
-                          init_filters=32, 
-                          in_channels=in_channels, 
-                          out_channels=num_classes, 
-                          dropout_prob=0.2, 
-                          blocks_down=(1, 2, 2, 4), 
+        model = SegResNet(spatial_dims=spatial_size,
+                          init_filters=32,
+                          in_channels=in_channels,
+                          out_channels=num_classes,
+                          dropout_prob=0.2,
+                          blocks_down=(1, 2, 2, 4),
                           blocks_up=(1, 1, 1)).to(device)
     # UNET
     elif cfg.model.architecture == "unet3d":
-        model = UNet3D(in_channels=in_channels, 
+        model = UNet3D(in_channels=in_channels,
                        num_classes=num_classes).to(device)
-        
+
     # VNet
     elif cfg.model.architecture == "v_net":
-        model = VNet(spatial_dims=spatial_size, 
-                     in_channels=in_channels, 
+        model = VNet(spatial_dims=spatial_size,
+                     in_channels=in_channels,
                      out_channels=num_classes,
                      dropout_dim=1,
                      bias= False
                         ).to(device)
     # Attention UNet
     elif cfg.model.architecture == "attention_unet":
-        model = AttentionUnet(spatial_dims=spatial_size, 
-                              in_channels=in_channels, 
-                              out_channels=num_classes, 
-                              channels= (8, 16, 32, 64, 128), 
+        model = AttentionUnet(spatial_dims=spatial_size,
+                              in_channels=in_channels,
+                              out_channels=num_classes,
+                              channels= (8, 16, 32, 64, 128),
                               strides = (2, 2, 2, 2),
                                            ).to(device)
     # ResUNetpp
@@ -507,10 +597,10 @@ def main(cfg: DictConfig):
                                 out_channels=num_classes).to(device)
     # UNETR
     elif cfg.model.architecture == "unet_r":
-       model =  UNETR(in_channels=in_channels, 
-                     out_channels=num_classes, 
-                     img_size=crop_size, 
-                     proj_type='conv', 
+       model =  UNETR(in_channels=in_channels,
+                     out_channels=num_classes,
+                     img_size=crop_size,
+                     proj_type='conv',
                      norm_name='instance').to(device)
     # SwinUNETR
     elif cfg.model.architecture == "swinunet_r":
@@ -527,63 +617,63 @@ def main(cfg: DictConfig):
                 use_v2=False).to(device)
     # UXNet
     elif cfg.model.architecture == "ux_net":
-        model = UXNET(in_chans= in_channels, 
+        model = UXNET(in_chans= in_channels,
                       out_chans= num_classes,
                       depths=[2, 2, 2, 2],
                       feat_size=[48, 96, 192, 384],
                       drop_path_rate=0,
-                      layer_scale_init_value=1e-6, 
+                      layer_scale_init_value=1e-6,
                       spatial_dims=spatial_size).to(device)
-    
+
     # nnFormer
     elif cfg.model.architecture == "nn_former":
-        model = nnFormer(crop_size=np.array(crop_size), 
-                         embedding_dim=96, 
-                         input_channels=in_channels, 
-                         num_classes=num_classes, 
-                         depths=[2, 2, 2, 2], 
-                         num_heads=[3, 6, 12, 24], 
+        model = nnFormer(crop_size=np.array(crop_size),
+                         embedding_dim=96,
+                         input_channels=in_channels,
+                         num_classes=num_classes,
+                         depths=[2, 2, 2, 2],
+                         num_heads=[3, 6, 12, 24],
                          deep_supervision=False,
                          conv_op=nn.Conv3d,
-                         patch_size= [4,4,4], 
+                         patch_size= [4,4,4],
                          window_size=[4,4,8,4]).to(device)
     # SegConvNet
     elif cfg.model.architecture == "seg_uxnet":
-        model = SegUXNet(spatial_dims=3, 
-                         init_filters=32, 
+        model = SegUXNet(spatial_dims=3,
+                         init_filters=32,
                          in_channels= in_channels,
-                         out_channels=num_classes, 
-                         dropout_prob=0.2, 
-                         blocks_down=(1, 2, 2, 4), 
-                         blocks_up=(1, 1, 1), 
+                         out_channels=num_classes,
+                         dropout_prob=0.2,
+                         blocks_down=(1, 2, 2, 4),
+                         blocks_up=(1, 1, 1),
                          enable_gc=True).to(device)
-        
+
     # SegSCNet spatail channel distinct feature learning net (NOT OPEN SOURCE)
     elif cfg.model.architecture == "seg_scnet":
-        model = SegSCNet(in_channels=in_channels, 
-                         out_channels=num_classes, 
-                         feature_size=24, 
-                         hidden_size=384, 
-                         num_heads=4, 
-                         dims=[48, 96, 192, 384], 
-                         depths=[3, 3, 3, 3], 
+        model = SegSCNet(in_channels=in_channels,
+                         out_channels=num_classes,
+                         feature_size=24,
+                         hidden_size=384,
+                         num_heads=4,
+                         dims=[48, 96, 192, 384],
+                         depths=[3, 3, 3, 3],
                          do_ds=False).to(device)
-        
+
     # Experimental (NOT open source yet)
     elif cfg.model.architecture == "scfe_net":
-        model = SCFENet(spatial_dims=spatial_size, 
-                    init_filters=32, 
-                    in_channels=in_channels, 
-                    out_channels=num_classes, 
-                    blocks_down=(1, 2, 2, 4), 
-                    blocks_up= (1, 1, 1), 
-                    gradient_checkpointing=True, 
-                    num_heads=4, 
+        model = SCFENet(spatial_dims=spatial_size,
+                    init_filters=32,
+                    in_channels=in_channels,
+                    out_channels=num_classes,
+                    blocks_down=(1, 2, 2, 4),
+                    blocks_up= (1, 1, 1),
+                    gradient_checkpointing=True,
+                    num_heads=4,
                     dropout_prob=0.2,
-                    attn_dropout_rate=0.1, 
+                    attn_dropout_rate=0.1,
                     do_ds=False,
-                    positional_embedding="perceptron", 
-                    drop_path=True, 
+                    positional_embedding="perceptron",
+                    drop_path=True,
                     qkv_bias=False,
                     ).to(device)
     print('Chosen Network Architecture: {}'.format(cfg.model.architecture))
@@ -592,12 +682,12 @@ def main(cfg: DictConfig):
     # Sliding window inference on evaluation dataset.
     model_inferer = partial(
                         sliding_window_inference,
-                        roi_size=[roi] * 3, 
+                        roi_size=[roi] * 3,
                         sw_batch_size=cfg.training.sw_batch_size,
                         predictor=model,
                         overlap=cfg.model.infer_overlap)
-    
-    # Validation frequency 
+
+    # Validation frequency
     val_every = cfg.training.val_every
 
     # Dice or Dice and Cross Entropy loss combined
@@ -608,15 +698,15 @@ def main(cfg: DictConfig):
     elif cfg.training.loss_type == "dice_ce":
         loss_func = DiceCELoss(to_onehot_y=False, sigmoid=True)
 
-    # Dice metric 
+    # Dice metric
     if cfg.dataset.type == 'brats':
-        acc_func =  DiceMetric(include_background=True, reduction=MetricReduction.MEAN_BATCH, 
+        acc_func =  DiceMetric(include_background=True, reduction=MetricReduction.MEAN_BATCH,
                                         get_not_nans=True)
     elif cfg.dataset.type == "btcv":
         acc_func = DiceMetric(include_background=True, reduction="mean", get_not_nans=False)
-        
+
     # Optimizer
-    solver = Solver(model=model, lr=cfg.training.learning_rate, 
+    solver = Solver(model=model, lr=cfg.training.learning_rate,
                        weight_decay=cfg.training.weight_decay)
     optimizer = solver.select_solver(cfg.training.solver_name)
 
@@ -630,11 +720,11 @@ def main(cfg: DictConfig):
         scheduler = PolyDecayScheduler(optimizer, total_epochs=max_epochs, initial_lr=cfg.training.learning_rate)
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_epochs)
-    
-    # Batch and workers 
+
+    # Batch and workers
     batch_size = cfg.training.batch_size
     num_workers = cfg.training.num_workers
-    
+
     # Set path to dataset (Customize to your case in configs)
     if cfg.training.colab:
         dataset_dir = cfg.dataset.colab
@@ -650,13 +740,13 @@ def main(cfg: DictConfig):
         train_dataset = get_datasets(dataset_dir, "train", target_size=(128, 128, 128))
         train_val_dataset = get_datasets(dataset_dir, "train_val", target_size=(128, 128, 128))
 
-        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, 
-                                                shuffle=True, num_workers=num_workers, 
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size,
+                                                shuffle=True, num_workers=num_workers,
                                                 drop_last=False, pin_memory=True)
-        
-        val_loader = torch.utils.data.DataLoader(train_val_dataset, 
-                                                batch_size=batch_size, 
-                                                shuffle=False, num_workers=num_workers, 
+
+        val_loader = torch.utils.data.DataLoader(train_val_dataset,
+                                                batch_size=batch_size,
+                                                shuffle=False, num_workers=num_workers,
                                                 pin_memory=True)
         # Start training
         run(cfg, model=model,
@@ -672,28 +762,27 @@ def main(cfg: DictConfig):
             post_pred=post_pred,
             max_epochs=max_epochs,
             val_every=val_every)
-        
-    elif cfg.dataset.type == "btcv":
-        train_loader, val_loader = get_dataset(num_samples = 4, 
-                                               device = device, 
-                                               data_dir = "data/", 
-                                               split_json = "dataset_0.json")
-        train(model=model, 
-              loss_function= loss_func, 
-              optimizer= optimizer, 
-              scaler= scaler, 
-              train_loader=train_loader, 
-              val_loader=val_loader, 
-              max_iterations=max_iterations, 
-              eval_num=eval_num, 
-              exp_name=cfg.training.exp_name, 
-              post_label=post_label, 
-              post_pred=post_pred, 
-              dice_metric_per_class= acc_func, 
-              device= device)
-        
 
-    
+    elif cfg.dataset.type == "btcv":
+        train_loader, val_loader = get_dataset(num_samples = 4,
+                                               device = device,
+                                               data_dir = "data/",
+                                               split_json = "dataset_0.json")
+        train(model=model,
+              loss_function= loss_func,
+              optimizer= optimizer,
+              scaler= scaler,
+              train_loader=train_loader,
+              val_loader=val_loader,
+              max_iterations=max_iterations,
+              eval_num=eval_num,
+              exp_name=cfg.training.exp_name,
+              post_label=post_label,
+              post_pred=post_pred,
+              dice_metric_per_class= acc_func,
+              device= device)
+    # After training finishes
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
