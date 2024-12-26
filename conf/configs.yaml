@@ -3,3 +3,7 @@ defaults:
   - dataset: default
   - training: default
   - test: default
+
+wandb:
+  enabled: false  # Set true if you want to use WandB
+  project_name: "brain-tumor-segmentation"

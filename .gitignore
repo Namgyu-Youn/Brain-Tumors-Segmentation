@@ -17,13 +17,13 @@ SegResNet-runs/
 SwinUNETR-runs/
 logger/
 logger.log
-test_model.py 
+test_model.py
 
 # Avoid pushing some common extensions mentioned here...
 *.pth
 *.pdf
 *.log
-*.csv 
+*.csv
 *.pt
 
 # training runs
@@ -32,8 +32,10 @@ ResUnetPlusPlus-runs/
 research/
 thesis/
 todo.txt
+
 # testing script custom architectures
 test_custom_models.py
+
 # loss test
 test_losses.py
 data_visualization_notebook.ipynb
@@ -42,6 +44,10 @@ plot_utils.py
 thesis.zip
 thesisv1/
 download_synapse.py
-.synapseCache/ # synapse dataset 
+.synapseCache/ # synapse dataset
 BTCV/
 RawData/
+
+# WandB files
+*.wandb
+wandb
